@@ -1,15 +1,15 @@
 /*
  * ============================================================================
  * PROJECT: OpenCV-exhibition-sentry
- * HARDWARE: Arduino Uno/Nano, 2x SG90 Servos, 16x2 I2C LCD, 5V Laser, Buzzer
+ * HARDWARE: Arduino Uno/Nano, 2x SG90 Servos, 16x2 I2C LCD, 5V Laser, Buzzer, LED
  * FEATURES INCLUDED:
- *  1. Priority State Machine (Breach Alert > Keypress Mode > Track Lock > Patrol)
- *  2. Non-Flickering 2-Line Telemetry (Padded string layout, formatted angles)
- *  3. Mechanical Safety Angle Limits (Pan: 10-170°, Tilt: 40-140°)
- *  4. USB Power-Safe Smooth Stepping (10ms step delay prevents brownout restarts)
- *  5. Visual/Audio Breach Alert (Strobe laser + 2.5kHz piezo siren on key 'B')
- *  6. Automatic Patrol Sweep (Sweeps side-to-side on 3s target loss)
- *  7. Full Profile Tracking Display (Target Red/Green/Blue, Face Lock, Manual)
+ *  1. Priority State Machine (Breach Alert > Shutdown > Proximity > Mode > Lock > Patrol)
+ *  2. AUTOMATIC BREACH ALERT with non-blocking 5-second cooldown
+ *  3. Automatic Patrol Sweep on target loss (3-second timeout)
+ *  4. Non-Flickering 2-Line Telemetry
+ *  5. Mechanical Safety Angle Limits (Pan: 10-170°, Tilt: 40-140°)
+ *  6. USB Power-Safe Smooth Stepping (10ms step delay)
+ *  7. Graceful Power-Down / Shutdown Routine (Key 'P')
  * ============================================================================
  */
 
@@ -17,96 +17,118 @@
 #include <LiquidCrystal_I2C.h>
 #include <Servo.h>
 
-// ----------------------------------------------------------------------------
 // 1. HARDWARE PIN DEFINITIONS
-// ----------------------------------------------------------------------------
-const int PAN_PIN = 9;       // Base horizontal servo pin
-const int TILT_PIN = 10;     // Vertical elevation servo pin
-const int LASER_PIN = 13;    // Target laser output pin
-const int BUZZER_PIN = 11;   // Piezo siren output pin
+const int PAN_PIN = 9;
+const int TILT_PIN = 10;
+const int LASER_PIN = 13;
+const int BUZZER_PIN = 11;
+const int PROX_LED_PIN = 6;
 
-// ----------------------------------------------------------------------------
 // 2. HARDWARE OBJECT INITIALIZATION
-// ----------------------------------------------------------------------------
 Servo panServo;
 Servo tiltServo;
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Address 0x27, 16 Columns, 2 Rows
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ----------------------------------------------------------------------------
-// 3. FEATURE: MECHANICAL SAFETY ANGLE LIMITS & SERVO TRACKING
-// Prevents servos from forcing against internal plastic stops (0° or 180°),
-// avoiding stall current spikes (>600mA) that trip USB ports.
-// ----------------------------------------------------------------------------
+// 3. MECHANICAL SAFETY ANGLE LIMITS
 const int MIN_PAN = 10;
 const int MAX_PAN = 170;
 const int MIN_TILT = 40;
 const int MAX_TILT = 140;
 
-int currentPan = 90;   // Live pan position (Initialized at center)
-int currentTilt = 90;  // Live tilt position (Initialized at center)
+int currentPan = 90;
+int currentTilt = 90;
 
-// ----------------------------------------------------------------------------
-// 4. FEATURE: AUTOMATIC PATROL SWEEP & TIMEOUT CONTROL
-// ----------------------------------------------------------------------------
+// 4. PATROL & TIMING VARIABLES
 int patrolPan = 90;
-int patrolDirection = 1;         // 1 = Move Right, -1 = Move Left
+int patrolDirection = 1;
 unsigned long lastPatrolStep = 0;
-const int PATROL_SPEED = 35;     // Step interval (ms) for smooth scan
+const int PATROL_SPEED = 35;
 
 unsigned long lastTargetTime = 0;
 bool targetAcquired = false;
-String activeProfileText = "RED"; // Tracks selected Python profile (RED/GREEN/BLUE/FACE/MANUAL)
+bool systemPoweredDown = false;
+String activeProfileText = "RED";
 
-// ----------------------------------------------------------------------------
-// 5. SETUP FUNCTION
-// ----------------------------------------------------------------------------
+// Proximity & Automatic Breach Cooldown
+unsigned long lastBreachTime = 0;
+const unsigned long BREACH_COOLDOWN = 5000; // 5 seconds between auto-sirens
+unsigned long lastProxFlashTime = 0;
+bool proxLedState = false;
+bool isTooClose = false;
+int currentBrightness = 10;
+
 void setup() {
-  Serial.begin(115200); // High-speed serial link with Python OpenCV
+  Serial.begin(115200);
   
   panServo.attach(PAN_PIN);
   tiltServo.attach(TILT_PIN);
   
   pinMode(LASER_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(LASER_PIN, HIGH); // Laser ON by default
+  pinMode(PROX_LED_PIN, OUTPUT);
   
-  // Center servos safely on startup
+  digitalWrite(LASER_PIN, HIGH);
+  analogWrite(PROX_LED_PIN, currentBrightness);
+  
   panServo.write(currentPan);
   tiltServo.write(currentTilt);
   
-  // Initialize LCD display
   lcd.init();
   lcd.backlight();
   
-  // Boot screen telemetry initialization
   updateLCD("STATE: PATROL", "MODE:RED SCAN");
 }
 
-// ----------------------------------------------------------------------------
-// 6. MAIN LOOP (PRIORITY STATE MACHINE EXECUTION)
-// ----------------------------------------------------------------------------
 void loop() {
   
   // ==========================================================================
-  // PRIORITY LEVEL 1, 2 & 3: PARSE SERIAL COMMANDS FROM PYTHON
+  // SERIAL COMMAND PARSER
   // ==========================================================================
   if (Serial.available() > 0) {
     String data = Serial.readStringUntil('\n');
     data.trim();
 
-    // --- PRIORITY 1: AUDIO/VISUAL BREACH ALERT (Key 'B' pressed in Python) ---
+    // --- PRIORITY 1: SHUTDOWN (Key 'P') ---
+    if (data == "SYS:POWERDOWN") {
+      executeShutdownSequence();
+      return;
+    }
+
+    systemPoweredDown = false;
+
+    // --- PRIORITY 2: BREACH ALERT (Auto-triggered or Key 'B') ---
     if (data == "ALERT:BREACH") {
-      triggerBreachAlert();
+      if (millis() - lastBreachTime > BREACH_COOLDOWN) {
+        lastBreachTime = millis();
+        triggerBreachAlert();
+      }
     }
     
-    // --- PRIORITY 2: MODE & COLOR SWITCHING CONFIRMATION (Keys 1, 2, 3, F, M) ---
+    // --- PRIORITY 3: PROXIMITY WARNING ---
+    else if (data == "ALERT:CLOSE") {
+      isTooClose = true;
+      updateLCD("WARNING: CLOSE!", "PROXIMITY BREACH");
+    }
+    
+    // --- PRIORITY 4: PROXIMITY DISTANCE VALUE ---
+    else if (data.startsWith("DIST:")) {
+      isTooClose = false;
+      int distValue = data.substring(5).toInt();
+      currentBrightness = constrain(distValue, 10, 255);
+      analogWrite(PROX_LED_PIN, currentBrightness);
+    }
+    
+    // --- PRIORITY 5: MODE SWITCHING ---
     else if (data.startsWith("MODE:")) {
-      activeProfileText = data.substring(5); // Extracts "RED", "GREEN", "BLUE", "FACE LOCK", etc.
+      isTooClose = false;
+      currentBrightness = 10;
+      analogWrite(PROX_LED_PIN, currentBrightness);
+      activeProfileText = data.substring(5);
       updateLCD("MODE SWITCHED", activeProfileText);
-      delay(500); // Brief hold so state confirmation is visible on LCD
+      delay(500);
     } 
     
-    // --- PRIORITY 3: ACTIVE TARGET COORDINATE LOCK (Serial String format "P90T100") ---
+    // --- PRIORITY 6: TARGET LOCK ("P90T100") ---
     else {
       int pIndex = data.indexOf('P');
       int tIndex = data.indexOf('T');
@@ -115,66 +137,74 @@ void loop() {
         int targetPan = data.substring(pIndex + 1, tIndex).toInt();
         int targetTilt = data.substring(tIndex + 1).toInt();
         
-        // ENFORCE FEATURE 3: Safety Angle Limits
         targetPan = constrain(targetPan, MIN_PAN, MAX_PAN);
         targetTilt = constrain(targetTilt, MIN_TILT, MAX_TILT);
         
-        // ENFORCE FEATURE 4: USB-Safe Smooth Stepping (10ms step delay)
         smoothMove(targetPan, targetTilt, 10);
         
         lastTargetTime = millis();
         targetAcquired = true;
         
-        // ENFORCE FEATURE 2 & 7: Telemetry LCD formatting with active profile
-        updateLCD("LOCK: " + activeProfileText, "P:" + formatAngle(targetPan) + " T:" + formatAngle(targetTilt) + " TRK");
+        if (!isTooClose) {
+          updateLCD("LOCK: " + activeProfileText, "P:" + formatAngle(targetPan) + " T:" + formatAngle(targetTilt) + " TRK");
+        }
       }
     }
   }
 
+  if (systemPoweredDown) return;
+
   // ==========================================================================
-  // PRIORITY LEVEL 4: AUTOMATIC CONTINUOUS PATROL SWEEP (WHEN NO TARGET LOCKED)
-  // Executes side-to-side scanning when Python is not sending target coordinates.
+  // NON-BLOCKING PROXIMITY LED BLINKING
+  // ==========================================================================
+  if (isTooClose) {
+    if (millis() - lastProxFlashTime >= 100) {
+      lastProxFlashTime = millis();
+      proxLedState = !proxLedState;
+      analogWrite(PROX_LED_PIN, proxLedState ? 255 : 0);
+    }
+  }
+
+  // ==========================================================================
+  // AUTOMATIC PATROL SWEEP
   // ==========================================================================
   if (!targetAcquired) {
     if (millis() - lastPatrolStep >= PATROL_SPEED) {
       lastPatrolStep = millis();
       
-      // Sweep bounds horizontal (30° to 150°)
       patrolPan += patrolDirection;
       if (patrolPan >= 150) {
         patrolPan = 150;
-        patrolDirection = -1; // Reverse left
+        patrolDirection = -1;
       } else if (patrolPan <= 30) {
         patrolPan = 30;
-        patrolDirection = 1;  // Reverse right
+        patrolDirection = 1;
       }
       
-      // Smooth step to patrol position while keeping tilt level (90°)
       smoothMove(patrolPan, 90, 0);
       
-      // ENFORCE FEATURE 2 & 6: Clean telemetry output during active patrol scan
-      updateLCD("STATE: PATROL", "MODE:" + activeProfileText + " SCAN");
+      if (!isTooClose) {
+        updateLCD("STATE: PATROL", "MODE:" + activeProfileText + " SCAN");
+      }
     }
   }
 
   // ==========================================================================
-  // AUTO-PATROL TIMEOUT RECOVERY
-  // Reverts turret state back to PATROL if target is lost for >3 seconds.
+  // AUTO-PATROL TIMEOUT RECOVERY (3 Seconds)
   // ==========================================================================
   if (targetAcquired && (millis() - lastTargetTime > 3000)) {
     targetAcquired = false;
-    patrolPan = currentPan; // Seamlessly resume sweeping from current position
+    isTooClose = false;
+    currentBrightness = 10;
+    analogWrite(PROX_LED_PIN, currentBrightness);
+    patrolPan = currentPan;
   }
 }
 
-// ----------------------------------------------------------------------------
-// 7. FUNCTION MODULES & HELPERS
-// ----------------------------------------------------------------------------
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
-/**
- * FEATURE 4: USB-Safe Smooth Stepping
- * Breaks continuous moves into 1-degree steps with delay to eliminate peak current spikes.
- */
 void smoothMove(int targetPan, int targetTilt, int stepDelay) {
   if (currentPan != targetPan) {
     if (currentPan < targetPan) currentPan++;
@@ -193,10 +223,6 @@ void smoothMove(int targetPan, int targetTilt, int stepDelay) {
   }
 }
 
-/**
- * FEATURE 2: Clean 2-Line LCD Telemetry Formatting
- * Pads line strings with empty spaces to overwrite previous text without running clear screen.
- */
 void updateLCD(String line1, String line2) {
   while (line1.length() < 16) line1 += " ";
   while (line2.length() < 16) line2 += " ";
@@ -207,27 +233,37 @@ void updateLCD(String line1, String line2) {
   lcd.print(line2);
 }
 
-/**
- * FEATURE 2 HELPER: Formats 1-3 digit numbers to fixed 3-digit strings ("009", "090").
- */
 String formatAngle(int angle) {
   if (angle < 10) return "00" + String(angle);
   if (angle < 100) return "0" + String(angle);
   return String(angle);
 }
 
-/**
- * FEATURE 5: Visual/Audio Breach Alert Routine
- * Strobes the laser pin and sounds a 2.5kHz piezo buzzer tone.
- */
 void triggerBreachAlert() {
   updateLCD("!! WARNING !!", "SYSTEM BREACH");
   for (int i = 0; i < 5; i++) {
-    digitalWrite(LASER_PIN, LOW);    // Laser OFF
-    tone(BUZZER_PIN, 2500);          // Sound Piezo Siren
+    digitalWrite(LASER_PIN, LOW);
+    digitalWrite(PROX_LED_PIN, LOW);
+    tone(BUZZER_PIN, 2500);
     delay(100);
-    digitalWrite(LASER_PIN, HIGH);   // Laser ON
-    noTone(BUZZER_PIN);              // Silent
+    digitalWrite(LASER_PIN, HIGH);
+    digitalWrite(PROX_LED_PIN, HIGH);
+    noTone(BUZZER_PIN);
     delay(100);
   }
+  analogWrite(PROX_LED_PIN, currentBrightness);
+}
+
+void executeShutdownSequence() {
+  systemPoweredDown = true;
+  updateLCD("POWERING DOWN...", "STANDBY MODE");
+  
+  digitalWrite(LASER_PIN, LOW);
+  analogWrite(PROX_LED_PIN, 0);
+  
+  while (currentPan != 90 || currentTilt != MIN_TILT) {
+    smoothMove(90, MIN_TILT, 15);
+  }
+  
+  updateLCD("SYS: OFFLINE", "CONN TERMINATED");
 }
