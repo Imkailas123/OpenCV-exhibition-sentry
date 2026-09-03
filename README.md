@@ -1,4 +1,4 @@
-# 🛡️ Sentinel-CV: Autonomous 2-DOF Targeting Sentry Turret
+# 🛡️ JARVIS-CV v1: Autonomous 2-DOF Targeting Sentry Turret
 
 An autonomous, computer-vision-powered 2-DOF targeting sentry turret built with OpenCV, Python, and Arduino for the Science Exhibition.
 
